@@ -15,13 +15,8 @@ export async function registerServiceWorker(wispUrl: string): Promise<ServiceWor
   // Wait for the service worker to be ready
   await navigator.serviceWorker.ready;
 
-  // Dynamically import bare-mux and connect to Wisp server
-  // @ts-ignore - bare-mux is loaded from static files
-  const { BareMux } = await import(/* @vite-ignore */ "/baremux/bare.mjs");
-  const connection = new BareMux("/baremux/worker.js");
-  
-  // Set the transport to epoxy with the Wisp server URL
-  await connection.setTransport("/epoxy/index.mjs", [{ wisp: wispUrl }]);
+  // Load bare-mux dynamically at runtime (not during build)
+  await initializeBareMux(wispUrl);
 
   console.log("[UV] Service Worker registered and connected to Wisp server:", wispUrl);
   
@@ -29,10 +24,44 @@ export async function registerServiceWorker(wispUrl: string): Promise<ServiceWor
 }
 
 /**
- * Encodes a URL for the Ultraviolet proxy
+ * Initialize bare-mux connection to Wisp server
+ */
+async function initializeBareMux(wispUrl: string): Promise<void> {
+  // Use dynamic import with a full URL to load from public folder at runtime
+  const bareMuxModule = await loadScript("/baremux/bare.mjs");
+  
+  if (bareMuxModule && (bareMuxModule as { BareMux?: unknown }).BareMux) {
+    const BareMux = (bareMuxModule as { BareMux: new (workerPath: string) => { setTransport: (transport: string, options: unknown[]) => Promise<void> } }).BareMux;
+    const connection = new BareMux("/baremux/worker.js");
+    await connection.setTransport("/epoxy/index.mjs", [{ wisp: wispUrl }]);
+  } else {
+    console.warn("[UV] BareMux not available, using fallback mode");
+  }
+}
+
+/**
+ * Load a script as an ES module dynamically
+ */
+async function loadScript(src: string): Promise<unknown> {
+  try {
+    // Create a blob URL to avoid Vite's module resolution
+    const response = await fetch(src);
+    const text = await response.text();
+    const blob = new Blob([text], { type: "application/javascript" });
+    const blobUrl = URL.createObjectURL(blob);
+    const module = await import(/* @vite-ignore */ blobUrl);
+    URL.revokeObjectURL(blobUrl);
+    return module;
+  } catch (error) {
+    console.error("[UV] Failed to load module:", src, error);
+    return null;
+  }
+}
+
+/**
+ * Encodes a URL for the Ultraviolet proxy using XOR encoding
  */
 export function encodeProxyUrl(url: string): string {
-  // XOR encode the URL (same as Ultraviolet's default codec)
   const encoded = xorEncode(url);
   return "/service/" + encoded;
 }
