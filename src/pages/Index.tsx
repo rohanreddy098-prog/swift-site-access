@@ -1,13 +1,20 @@
-// Update this page (the content is just a fallback if you fail to update the page)
+import { Layout } from "@/components/layout/Layout";
+import { HeroSection } from "@/components/home/HeroSection";
+import { Helmet } from "react-helmet-async";
 
 const Index = () => {
   return (
-    <div className="flex min-h-screen items-center justify-center bg-background">
-      <div className="text-center">
-        <h1 className="mb-4 text-4xl font-bold">Welcome to Your Blank App</h1>
-        <p className="text-xl text-muted-foreground">Start building your amazing project here!</p>
-      </div>
-    </div>
+    <>
+      <Helmet>
+        <title>ShuttleProxy - Browse the Web Without Limits</title>
+        <meta name="description" content="Access any website instantly and securely with ShuttleProxy. Your gateway to unrestricted internet with privacy-first technology. Fast, encrypted, and no logs." />
+        <meta name="keywords" content="web proxy, anonymous browsing, secure proxy, privacy, unblock websites" />
+        <link rel="canonical" href="https://shuttleproxy.com" />
+      </Helmet>
+      <Layout>
+        <HeroSection />
+      </Layout>
+    </>
   );
 };
 
