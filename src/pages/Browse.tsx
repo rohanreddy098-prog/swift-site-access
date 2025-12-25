@@ -63,14 +63,11 @@ const Browse = () => {
         console.log('[Browse] Navigation request:', newUrl);
         
         if (event.data.newTab) {
-          // Open in new tab through proxy
           window.open(`/browse/${encodeURIComponent(newUrl)}`, '_blank');
         } else {
-          // Navigate in current view
           navigate(`/browse/${encodeURIComponent(newUrl)}`);
         }
       } else if (event.data?.type === 'proxy-url-change') {
-        // URL changed via history API
         setCurrentUrl(event.data.url);
       }
     };
@@ -78,15 +75,6 @@ const Browse = () => {
     window.addEventListener('message', handleMessage);
     return () => window.removeEventListener('message', handleMessage);
   }, [navigate]);
-
-  // Set iframe to full viewport height - no dynamic adjustment to prevent flickering
-  useEffect(() => {
-    const iframe = iframeRef.current;
-    if (iframe && content) {
-      // Use viewport height instead of dynamic content height to prevent flickering
-      iframe.style.height = 'calc(100vh - 48px)';
-    }
-  }, [content]);
 
   const handleRefresh = () => {
     if (currentUrl) {
@@ -97,19 +85,17 @@ const Browse = () => {
   };
 
   return (
-    <div className="min-h-screen flex flex-col bg-background">
+    <div className="h-screen flex flex-col bg-background overflow-hidden">
       <LoadingBar isLoading={isLoading} className="fixed top-0 left-0 right-0 z-50" />
       
       {!isLoading && !error && (
-        <ProxyInfoBar 
-          targetUrl={currentUrl || decodedUrl} 
-        />
+        <ProxyInfoBar targetUrl={currentUrl || decodedUrl} />
       )}
 
       {/* Content area */}
-      <div className="flex-1">
+      <div className="flex-1 overflow-hidden">
         {isLoading && (
-          <div className="flex flex-col items-center justify-center min-h-screen gap-4">
+          <div className="flex flex-col items-center justify-center h-full gap-4">
             <div className="w-16 h-16 rounded-full gradient-primary animate-pulse-glow flex items-center justify-center">
               <RefreshCw className="w-8 h-8 text-primary-foreground animate-spin" />
             </div>
@@ -119,7 +105,7 @@ const Browse = () => {
         )}
 
         {error && (
-          <div className="flex flex-col items-center justify-center min-h-screen gap-6 px-4">
+          <div className="flex flex-col items-center justify-center h-full gap-6 px-4">
             <div className="w-20 h-20 rounded-full bg-destructive/10 flex items-center justify-center">
               <AlertTriangle className="w-10 h-10 text-destructive" />
             </div>
@@ -150,16 +136,13 @@ const Browse = () => {
         )}
 
         {!isLoading && !error && content && (
-          <div className="w-full pt-12">
-            <iframe
-              ref={iframeRef}
-              srcDoc={content}
-              className="w-full min-h-screen border-0"
-              sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox allow-presentation allow-modals"
-              title="Proxied content"
-              style={{ display: "block" }}
-            />
-          </div>
+          <iframe
+            ref={iframeRef}
+            srcDoc={content}
+            className="w-full h-full border-0"
+            sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox allow-presentation allow-modals"
+            title="Proxied content"
+          />
         )}
       </div>
 
