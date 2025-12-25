@@ -3,9 +3,8 @@
   "version": "1.0.0",
   "description": "Wisp WebSocket server for Ultraviolet proxy",
   "main": "server.js",
-  "scripts": {
-    "start": "node server.js"
-  },
+  "type": "module",
+  "scripts": {},
   "engines": {
     "node": ">=20.0.0"
   },
