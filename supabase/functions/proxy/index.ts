@@ -9,10 +9,24 @@ const corsHeaders = {
 
 const BLOCKED_PROTOCOLS = ["javascript:", "file:", "data:", "blob:"];
 
+// Sites that are known to not work well with proxies
+const PROBLEMATIC_SITES = [
+  "youtube.com", "www.youtube.com", "m.youtube.com",
+  "instagram.com", "www.instagram.com",
+  "facebook.com", "www.facebook.com", "m.facebook.com",
+  "twitter.com", "www.twitter.com", "x.com", "www.x.com",
+  "tiktok.com", "www.tiktok.com",
+  "netflix.com", "www.netflix.com",
+  "google.com", "www.google.com",
+  "accounts.google.com", "login.microsoftonline.com"
+];
+
 serve(async (req) => {
   if (req.method === "OPTIONS") {
     return new Response(null, { headers: corsHeaders });
   }
+
+  const startTime = Date.now();
 
   try {
     const { url } = await req.json();
@@ -45,62 +59,75 @@ serve(async (req) => {
       });
     }
 
-    // Check blocked domains
+    // Check if site is known to be problematic
+    const hostname = targetUrl.hostname.toLowerCase();
+    if (PROBLEMATIC_SITES.includes(hostname)) {
+      return new Response(JSON.stringify({ 
+        error: `${hostname} uses advanced security measures that prevent proxy access. Try simpler websites.`,
+        isBlocked: true
+      }), {
+        status: 403,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    // Initialize Supabase client
     const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
     const supabaseKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
     const supabase = createClient(supabaseUrl, supabaseKey);
 
-    const { data: blocked } = await supabase
-      .from("blocked_domains")
-      .select("domain")
-      .eq("domain", targetUrl.hostname)
-      .maybeSingle();
+    // Check blocked domains and maintenance mode in parallel
+    const [blockedResult, maintenanceResult] = await Promise.all([
+      supabase
+        .from("blocked_domains")
+        .select("domain")
+        .eq("domain", hostname)
+        .maybeSingle(),
+      supabase
+        .from("site_settings")
+        .select("value")
+        .eq("key", "maintenance_mode")
+        .maybeSingle()
+    ]);
 
-    if (blocked) {
+    if (blockedResult.data) {
       return new Response(JSON.stringify({ error: "This domain is blocked" }), {
         status: 403,
         headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
     }
 
-    // Check maintenance mode
-    const { data: maintenance } = await supabase
-      .from("site_settings")
-      .select("value")
-      .eq("key", "maintenance_mode")
-      .maybeSingle();
-
-    if (maintenance?.value === "true") {
+    if (maintenanceResult.data?.value === "true") {
       return new Response(JSON.stringify({ error: "Service is under maintenance" }), {
         status: 503,
         headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
     }
 
-    // Fetch the target URL with better headers
-    console.log(`Proxying request to: ${url}`);
+    // Fetch the target URL with optimized headers
+    console.log(`Fetching: ${url}`);
     
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15000); // 15s timeout
+
     const response = await fetch(url, {
       headers: {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
         "Accept-Encoding": "identity",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-        "Sec-Fetch-User": "?1",
-        "Upgrade-Insecure-Requests": "1",
       },
       redirect: "follow",
+      signal: controller.signal,
     });
+
+    clearTimeout(timeout);
 
     const contentType = response.headers.get("content-type") || "";
     const content = await response.text();
+    const baseUrl = `${targetUrl.protocol}//${targetUrl.host}`;
 
-    // Log request for analytics (fire and forget)
+    // Log request asynchronously (don't await)
     supabase.from("proxy_requests").insert({
       target_url: url,
       status_code: response.status,
@@ -108,109 +135,14 @@ serve(async (req) => {
       user_agent: req.headers.get("user-agent"),
     });
 
-    // Rewrite URLs in HTML content
+    // Process HTML content
     let processedContent = content;
     if (contentType.includes("text/html")) {
-      const baseUrl = `${targetUrl.protocol}//${targetUrl.host}`;
-      
-      // Inject base tag right after opening head tag
-      if (processedContent.match(/<head[^>]*>/i)) {
-        processedContent = processedContent.replace(
-          /<head([^>]*)>/i,
-          `<head$1><base href="${baseUrl}/" target="_self">`
-        );
-      } else {
-        // If no head tag, add one
-        processedContent = `<head><base href="${baseUrl}/" target="_self"></head>` + processedContent;
-      }
-      
-      // Remove Content-Security-Policy meta tags that might block content
-      processedContent = processedContent.replace(
-        /<meta[^>]*http-equiv=["']?Content-Security-Policy["']?[^>]*>/gi,
-        ""
-      );
-      
-      // Remove X-Frame-Options meta tags
-      processedContent = processedContent.replace(
-        /<meta[^>]*http-equiv=["']?X-Frame-Options["']?[^>]*>/gi,
-        ""
-      );
-      
-      // Fix protocol-relative URLs
-      processedContent = processedContent.replace(
-        /src=["']\/\//g,
-        `src="${targetUrl.protocol}//`
-      );
-      processedContent = processedContent.replace(
-        /href=["']\/\//g,
-        `href="${targetUrl.protocol}//`
-      );
-      
-      // Fix relative URLs that start with /
-      processedContent = processedContent.replace(
-        /src=["']\//g,
-        `src="${baseUrl}/`
-      );
-      processedContent = processedContent.replace(
-        /href=["']\//g,
-        `href="${baseUrl}/`
-      );
-      
-      // Fix srcset attributes
-      processedContent = processedContent.replace(
-        /srcset=["']([^"']+)["']/gi,
-        (match, srcset) => {
-          const fixedSrcset = srcset.replace(/(^|\s)\/(?!\/)/g, `$1${baseUrl}/`);
-          return `srcset="${fixedSrcset}"`;
-        }
-      );
-      
-      // Add CSS to handle body/html sizing for proper iframe display
-      const styleInjection = `
-        <style>
-          html, body { 
-            margin: 0 !important; 
-            padding: 0 !important;
-            min-height: 100vh !important;
-            overflow-x: hidden !important;
-          }
-        </style>
-      `;
-      
-      // Inject script to handle relative URLs in dynamically loaded content
-      const scriptInjection = `
-        <script>
-          (function() {
-            var baseUrl = "${baseUrl}";
-            
-            // Override fetch to handle relative URLs
-            var originalFetch = window.fetch;
-            window.fetch = function(url, options) {
-              if (typeof url === 'string' && url.startsWith('/') && !url.startsWith('//')) {
-                url = baseUrl + url;
-              }
-              return originalFetch.call(this, url, options);
-            };
-            
-            // Override XMLHttpRequest
-            var originalOpen = XMLHttpRequest.prototype.open;
-            XMLHttpRequest.prototype.open = function(method, url) {
-              if (typeof url === 'string' && url.startsWith('/') && !url.startsWith('//')) {
-                url = baseUrl + url;
-              }
-              return originalOpen.apply(this, [method, url, ...Array.prototype.slice.call(arguments, 2)]);
-            };
-          })();
-        </script>
-      `;
-      
-      if (processedContent.match(/<\/head>/i)) {
-        processedContent = processedContent.replace(
-          /<\/head>/i,
-          `${styleInjection}${scriptInjection}</head>`
-        );
-      }
+      processedContent = processHtml(content, baseUrl, targetUrl.protocol);
     }
+
+    const elapsed = Date.now() - startTime;
+    console.log(`Completed in ${elapsed}ms, size: ${content.length}`);
 
     return new Response(
       JSON.stringify({ content: processedContent, status: response.status }),
@@ -220,7 +152,16 @@ serve(async (req) => {
     );
   } catch (error: unknown) {
     console.error("Proxy error:", error);
-    const message = error instanceof Error ? error.message : "Failed to fetch website";
+    let message = "Failed to fetch website";
+    
+    if (error instanceof Error) {
+      if (error.name === "AbortError") {
+        message = "Request timed out - the website took too long to respond";
+      } else {
+        message = error.message;
+      }
+    }
+    
     return new Response(
       JSON.stringify({ error: message }),
       {
@@ -230,3 +171,38 @@ serve(async (req) => {
     );
   }
 });
+
+function processHtml(html: string, baseUrl: string, protocol: string): string {
+  let processed = html;
+  
+  // Add base tag after head
+  if (processed.match(/<head[^>]*>/i)) {
+    processed = processed.replace(
+      /<head([^>]*)>/i,
+      `<head$1><base href="${baseUrl}/">`
+    );
+  } else {
+    processed = `<head><base href="${baseUrl}/"></head>` + processed;
+  }
+  
+  // Remove security headers that block iframe embedding
+  processed = processed.replace(
+    /<meta[^>]*http-equiv=["']?(Content-Security-Policy|X-Frame-Options)["']?[^>]*>/gi,
+    ""
+  );
+  
+  // Fix protocol-relative URLs
+  processed = processed.replace(/src=["']\/\//g, `src="${protocol}//`);
+  processed = processed.replace(/href=["']\/\//g, `href="${protocol}//`);
+  
+  // Inject minimal CSS for iframe display
+  const injection = `
+    <style>html,body{margin:0!important;padding:0!important;min-height:100vh}</style>
+  `;
+  
+  if (processed.match(/<\/head>/i)) {
+    processed = processed.replace(/<\/head>/i, `${injection}</head>`);
+  }
+  
+  return processed;
+}
