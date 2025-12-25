@@ -2,11 +2,15 @@
 
 WebSocket server for Ultraviolet proxy deployment on Railway.
 
+## ⚠️ IMPORTANT
+
+**DO NOT include `bun.lockb` in your repository!** Railway auto-detects bun and causes build failures. Only include the files listed below.
+
 ## Quick Deploy
 
 ### 1. Create GitHub Repository
 
-Create a new GitHub repository and upload these files:
+Create a new GitHub repository and upload **ONLY** these files:
 - `package.json`
 - `server.js`
 - `railway.json`
