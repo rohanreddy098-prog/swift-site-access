@@ -1,5 +1,5 @@
 import { useParams, useNavigate } from "react-router-dom";
-import { useEffect, useState, useRef } from "react";
+import { useEffect, useState, useRef, useCallback } from "react";
 import { LoadingBar } from "@/components/proxy/LoadingBar";
 import { ProxyInfoBar } from "@/components/proxy/ProxyInfoBar";
 import { Button } from "@/components/ui/button";
@@ -13,9 +13,38 @@ const Browse = () => {
   const [isLoading, setIsLoading] = useState(true);
   const [content, setContent] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [currentUrl, setCurrentUrl] = useState<string>("");
   const iframeRef = useRef<HTMLIFrameElement>(null);
 
   const decodedUrl = url ? decodeURIComponent(url) : "";
+
+  const fetchContent = useCallback(async (targetUrl: string) => {
+    setIsLoading(true);
+    setError(null);
+    setCurrentUrl(targetUrl);
+
+    try {
+      const { data, error: fnError } = await supabase.functions.invoke("proxy", {
+        body: { url: targetUrl },
+      });
+
+      if (fnError) {
+        throw new Error(fnError.message);
+      }
+
+      if (data.error) {
+        throw new Error(data.error);
+      }
+
+      setContent(data.content);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Failed to load website";
+      setError(message);
+      toast.error(message);
+    } finally {
+      setIsLoading(false);
+    }
+  }, []);
 
   useEffect(() => {
     if (!decodedUrl) {
@@ -23,35 +52,32 @@ const Browse = () => {
       return;
     }
 
-    const fetchContent = async () => {
-      setIsLoading(true);
-      setError(null);
+    fetchContent(decodedUrl);
+  }, [decodedUrl, navigate, fetchContent]);
 
-      try {
-        const { data, error: fnError } = await supabase.functions.invoke("proxy", {
-          body: { url: decodedUrl },
-        });
-
-        if (fnError) {
-          throw new Error(fnError.message);
+  // Listen for navigation messages from iframe
+  useEffect(() => {
+    const handleMessage = (event: MessageEvent) => {
+      if (event.data?.type === 'proxy-navigate') {
+        const newUrl = event.data.url;
+        console.log('[Browse] Navigation request:', newUrl);
+        
+        if (event.data.newTab) {
+          // Open in new tab through proxy
+          window.open(`/browse/${encodeURIComponent(newUrl)}`, '_blank');
+        } else {
+          // Navigate in current view
+          navigate(`/browse/${encodeURIComponent(newUrl)}`);
         }
-
-        if (data.error) {
-          throw new Error(data.error);
-        }
-
-        setContent(data.content);
-      } catch (err) {
-        const message = err instanceof Error ? err.message : "Failed to load website";
-        setError(message);
-        toast.error(message);
-      } finally {
-        setIsLoading(false);
+      } else if (event.data?.type === 'proxy-url-change') {
+        // URL changed via history API
+        setCurrentUrl(event.data.url);
       }
     };
 
-    fetchContent();
-  }, [decodedUrl, navigate]);
+    window.addEventListener('message', handleMessage);
+    return () => window.removeEventListener('message', handleMessage);
+  }, [navigate]);
 
   // Adjust iframe height after load
   useEffect(() => {
@@ -61,7 +87,6 @@ const Browse = () => {
         try {
           const doc = iframe.contentDocument;
           if (doc) {
-            // Try to get actual content height
             const height = Math.max(
               doc.body?.scrollHeight || 0,
               doc.documentElement?.scrollHeight || 0,
@@ -79,11 +104,23 @@ const Browse = () => {
     }
   }, [content]);
 
+  const handleRefresh = () => {
+    if (currentUrl) {
+      fetchContent(currentUrl);
+    } else if (decodedUrl) {
+      fetchContent(decodedUrl);
+    }
+  };
+
   return (
     <div className="min-h-screen flex flex-col bg-background">
       <LoadingBar isLoading={isLoading} className="fixed top-0 left-0 right-0 z-50" />
       
-      {!isLoading && !error && <ProxyInfoBar targetUrl={decodedUrl} />}
+      {!isLoading && !error && (
+        <ProxyInfoBar 
+          targetUrl={currentUrl || decodedUrl} 
+        />
+      )}
 
       {/* Content area */}
       <div className="flex-1">
@@ -93,7 +130,7 @@ const Browse = () => {
               <RefreshCw className="w-8 h-8 text-primary-foreground animate-spin" />
             </div>
             <p className="text-muted-foreground">Loading website...</p>
-            <p className="text-sm text-muted-foreground/70">Fetching {decodedUrl}</p>
+            <p className="text-sm text-muted-foreground/70">Fetching {currentUrl || decodedUrl}</p>
           </div>
         )}
 
@@ -106,7 +143,7 @@ const Browse = () => {
               <h2 className="text-2xl font-bold mb-2">Unable to Load Website</h2>
               <p className="text-muted-foreground max-w-md mb-4">{error}</p>
               <p className="text-sm text-muted-foreground/70">
-                Some websites block proxy access or have strict security policies.
+                Some websites use advanced security that prevents proxy access.
               </p>
             </div>
             <div className="flex flex-wrap gap-3 justify-center">
@@ -114,11 +151,11 @@ const Browse = () => {
                 <ArrowLeft className="w-4 h-4 mr-2" />
                 Go Back
               </Button>
-              <Button onClick={() => window.location.reload()}>
+              <Button onClick={handleRefresh}>
                 <RefreshCw className="w-4 h-4 mr-2" />
                 Try Again
               </Button>
-              <a href={decodedUrl} target="_blank" rel="noopener noreferrer">
+              <a href={currentUrl || decodedUrl} target="_blank" rel="noopener noreferrer">
                 <Button variant="secondary">
                   <ExternalLink className="w-4 h-4 mr-2" />
                   Open Directly
@@ -134,7 +171,7 @@ const Browse = () => {
               ref={iframeRef}
               srcDoc={content}
               className="w-full min-h-screen border-0"
-              sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox allow-presentation"
+              sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox allow-presentation allow-modals"
               title="Proxied content"
               style={{ display: "block" }}
             />
