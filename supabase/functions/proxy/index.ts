@@ -198,7 +198,12 @@ function processHtml(html: string, baseUrl: string, protocol: string, originalUr
       html, body {
         margin: 0 !important;
         padding: 0 !important;
-        min-height: 100vh;
+        width: 100% !important;
+        height: 100% !important;
+        overflow-x: hidden;
+      }
+      html {
+        overflow-y: auto !important;
       }
     </style>
     <script>
