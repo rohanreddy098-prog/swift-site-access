@@ -1,1 +1,7 @@
 project_id = "hrwhcsabcdgeasogwhhx"
+
+[functions.proxy]
+verify_jwt = false
+
+[functions.proxy-resource]
+verify_jwt = false

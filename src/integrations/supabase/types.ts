@@ -59,6 +59,36 @@ export type Database = {
         }
         Relationships: []
       }
+      proxy_cookies: {
+        Row: {
+          cookies: Json
+          created_at: string
+          domain: string
+          expires_at: string | null
+          id: string
+          session_id: string
+          updated_at: string
+        }
+        Insert: {
+          cookies?: Json
+          created_at?: string
+          domain: string
+          expires_at?: string | null
+          id?: string
+          session_id: string
+          updated_at?: string
+        }
+        Update: {
+          cookies?: Json
+          created_at?: string
+          domain?: string
+          expires_at?: string | null
+          id?: string
+          session_id?: string
+          updated_at?: string
+        }
+        Relationships: []
+      }
       proxy_requests: {
         Row: {
           created_at: string
@@ -157,6 +187,7 @@ export type Database = {
       [_ in never]: never
     }
     Functions: {
+      cleanup_expired_cookies: { Args: never; Returns: undefined }
       has_role: {
         Args: {
           _role: Database["public"]["Enums"]["app_role"]

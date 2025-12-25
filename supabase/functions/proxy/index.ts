@@ -41,7 +41,7 @@ serve(async (req) => {
   const startTime = Date.now();
 
   try {
-    const { url, type } = await req.json();
+    const { url, type, sessionId } = await req.json();
     
     if (!url) {
       return new Response(JSON.stringify({ error: "URL is required" }), {
@@ -79,7 +79,7 @@ serve(async (req) => {
     const hostname = targetUrl.hostname.toLowerCase();
 
     // Check blocked domains and maintenance mode in parallel
-    const [blockedResult, maintenanceResult] = await Promise.all([
+    const [blockedResult, maintenanceResult, cookiesResult] = await Promise.all([
       supabase
         .from("blocked_domains")
         .select("domain")
@@ -89,7 +89,13 @@ serve(async (req) => {
         .from("site_settings")
         .select("value")
         .eq("key", "maintenance_mode")
-        .maybeSingle()
+        .maybeSingle(),
+      sessionId ? supabase
+        .from("proxy_cookies")
+        .select("cookies")
+        .eq("session_id", sessionId)
+        .eq("domain", hostname)
+        .maybeSingle() : Promise.resolve({ data: null })
     ]);
 
     if (blockedResult.data) {
@@ -143,6 +149,17 @@ serve(async (req) => {
       Object.assign(requestHeaders, CLIENT_HINTS);
     }
 
+    // Add stored cookies if available
+    if (cookiesResult.data?.cookies) {
+      const cookies = cookiesResult.data.cookies;
+      if (typeof cookies === 'object' && Object.keys(cookies).length > 0) {
+        const cookieString = Object.entries(cookies)
+          .map(([k, v]) => `${k}=${v}`)
+          .join('; ');
+        requestHeaders["Cookie"] = cookieString;
+      }
+    }
+
     const response = await fetch(url, {
       headers: requestHeaders,
       redirect: "follow",
@@ -153,6 +170,29 @@ serve(async (req) => {
 
     const contentType = response.headers.get("content-type") || "";
     const baseUrl = `${targetUrl.protocol}//${targetUrl.host}`;
+
+    // Extract and store cookies from response
+    const setCookieHeaders = response.headers.getSetCookie?.() || [];
+    if (sessionId && setCookieHeaders.length > 0) {
+      const cookieObj: Record<string, string> = {};
+      for (const cookie of setCookieHeaders) {
+        const [nameValue] = cookie.split(';');
+        const [name, value] = nameValue.split('=');
+        if (name && value) {
+          cookieObj[name.trim()] = value.trim();
+        }
+      }
+      
+      // Upsert cookies
+      if (Object.keys(cookieObj).length > 0) {
+        supabase.from("proxy_cookies").upsert({
+          session_id: sessionId,
+          domain: hostname,
+          cookies: cookieObj,
+          updated_at: new Date().toISOString(),
+        }, { onConflict: 'session_id,domain' });
+      }
+    }
 
     // Log request asynchronously (don't await)
     supabase.from("proxy_requests").insert({
@@ -231,17 +271,135 @@ function processHtml(html: string, baseUrl: string, protocol: string, originalUr
     processed = `<head>${baseTag}</head>` + processed;
   }
   
+  // ============================================
+  // ENHANCED URL REWRITING
+  // ============================================
+  
   // Fix protocol-relative URLs
   processed = processed.replace(/src=["']\/\//g, `src="${protocol}//`);
   processed = processed.replace(/href=["']\/\//g, `href="${protocol}//`);
-  processed = processed.replace(/srcset=["'][^"']*\/\//g, (match) => match.replace(/\/\//, `${protocol}//`));
+  
+  // Enhanced srcset rewriting
+  processed = processed.replace(/srcset=["']([^"']+)["']/gi, (match, srcset) => {
+    const rewritten = srcset.replace(/(\S+)\s+(\d+[wx])/g, (m: string, url: string, descriptor: string) => {
+      if (url.startsWith('//')) {
+        return `${protocol}${url} ${descriptor}`;
+      }
+      if (url.startsWith('/')) {
+        return `${baseUrl}${url} ${descriptor}`;
+      }
+      return `${url} ${descriptor}`;
+    });
+    return `srcset="${rewritten}"`;
+  });
+  
+  // Rewrite data-src and data-srcset (lazy loading)
+  processed = processed.replace(/data-src=["']([^"']+)["']/gi, (match, src) => {
+    if (src.startsWith('//')) return `data-src="${protocol}${src}"`;
+    if (src.startsWith('/')) return `data-src="${baseUrl}${src}"`;
+    return match;
+  });
+  
+  processed = processed.replace(/data-srcset=["']([^"']+)["']/gi, (match, srcset) => {
+    const rewritten = srcset.replace(/(\S+)\s+(\d+[wx])/g, (m: string, url: string, descriptor: string) => {
+      if (url.startsWith('//')) return `${protocol}${url} ${descriptor}`;
+      if (url.startsWith('/')) return `${baseUrl}${url} ${descriptor}`;
+      return `${url} ${descriptor}`;
+    });
+    return `data-srcset="${rewritten}"`;
+  });
+  
+  // Rewrite source elements (video/audio/picture)
+  processed = processed.replace(/<source([^>]*?)src=["']([^"']+)["']/gi, (match, attrs, src) => {
+    let newSrc = src;
+    if (src.startsWith('//')) newSrc = `${protocol}${src}`;
+    else if (src.startsWith('/')) newSrc = `${baseUrl}${src}`;
+    return `<source${attrs}src="${newSrc}"`;
+  });
+  
+  // Rewrite poster attributes (video)
+  processed = processed.replace(/poster=["']([^"']+)["']/gi, (match, poster) => {
+    if (poster.startsWith('//')) return `poster="${protocol}${poster}"`;
+    if (poster.startsWith('/')) return `poster="${baseUrl}${poster}"`;
+    return match;
+  });
+  
+  // ============================================
+  // ENHANCED CSS REWRITING
+  // ============================================
+  
+  // Rewrite CSS url() in style attributes
+  processed = processed.replace(/style=["']([^"']+)["']/gi, (match, style) => {
+    const rewrittenStyle = rewriteCssUrls(style, baseUrl, protocol);
+    return `style="${rewrittenStyle}"`;
+  });
+  
+  // Rewrite inline <style> blocks
+  processed = processed.replace(/<style[^>]*>([\s\S]*?)<\/style>/gi, (match, css) => {
+    const rewrittenCss = rewriteCssUrls(css, baseUrl, protocol);
+    return match.replace(css, rewrittenCss);
+  });
+  
+  // Rewrite @import statements
+  processed = processed.replace(/@import\s+["']([^"']+)["']/gi, (match, url) => {
+    if (url.startsWith('//')) return `@import "${protocol}${url}"`;
+    if (url.startsWith('/')) return `@import "${baseUrl}${url}"`;
+    if (!url.startsWith('http')) return `@import "${baseUrl}/${url}"`;
+    return match;
+  });
+  
+  processed = processed.replace(/@import\s+url\(["']?([^"')]+)["']?\)/gi, (match, url) => {
+    if (url.startsWith('//')) return `@import url("${protocol}${url}")`;
+    if (url.startsWith('/')) return `@import url("${baseUrl}${url}")`;
+    if (!url.startsWith('http')) return `@import url("${baseUrl}/${url}")`;
+    return match;
+  });
   
   // Fix integrity attributes that can block resources
   processed = processed.replace(/\s+integrity=["'][^"']*["']/gi, "");
   processed = processed.replace(/\s+crossorigin=["'][^"']*["']/gi, "");
+  processed = processed.replace(/\s+nonce=["'][^"']*["']/gi, "");
+  
+  // Remove preload/prefetch that might cause issues
+  processed = processed.replace(/<link[^>]*rel=["']?(preconnect|dns-prefetch|preload|prefetch|modulepreload)["']?[^>]*>/gi, "");
   
   // Inject comprehensive anti-detection script
-  const injection = `
+  const injection = generateInjectionScript(originalUrl, baseUrl, hostname, protocol);
+  
+  // Inject before </head> or at the start
+  if (processed.match(/<\/head>/i)) {
+    processed = processed.replace(/<\/head>/i, `${injection}</head>`);
+  } else if (processed.match(/<body[^>]*>/i)) {
+    processed = processed.replace(/<body([^>]*)>/i, `${injection}<body$1>`);
+  } else {
+    processed = injection + processed;
+  }
+  
+  return processed;
+}
+
+function rewriteCssUrls(css: string, baseUrl: string, protocol: string): string {
+  // Rewrite url() in CSS
+  return css.replace(/url\(["']?([^"')]+)["']?\)/gi, (match, url) => {
+    // Skip data URIs and absolute URLs
+    if (url.startsWith('data:') || url.startsWith('blob:') || url.startsWith('#')) {
+      return match;
+    }
+    if (url.startsWith('//')) {
+      return `url("${protocol}${url}")`;
+    }
+    if (url.startsWith('/')) {
+      return `url("${baseUrl}${url}")`;
+    }
+    if (!url.startsWith('http')) {
+      return `url("${baseUrl}/${url}")`;
+    }
+    return match;
+  });
+}
+
+function generateInjectionScript(originalUrl: string, baseUrl: string, hostname: string, protocol: string): string {
+  return `
     <style>
       html, body {
         margin: 0 !important;
@@ -279,12 +437,30 @@ function processHtml(html: string, baseUrl: string, protocol: string, originalUr
         Object.defineProperty(navigator, 'plugins', {
           get: () => {
             const plugins = [
-              { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
-              { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '' },
-              { name: 'Native Client', filename: 'internal-nacl-plugin', description: '' }
+              { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format', length: 1 },
+              { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '', length: 1 },
+              { name: 'Native Client', filename: 'internal-nacl-plugin', description: '', length: 2 }
             ];
             plugins.length = 3;
+            plugins.item = (i) => plugins[i];
+            plugins.namedItem = (name) => plugins.find(p => p.name === name);
+            plugins.refresh = () => {};
             return plugins;
+          },
+          configurable: true
+        });
+        
+        // Spoof mimeTypes
+        Object.defineProperty(navigator, 'mimeTypes', {
+          get: () => {
+            const mimeTypes = [
+              { type: 'application/pdf', description: 'Portable Document Format', suffixes: 'pdf' },
+              { type: 'text/pdf', description: 'Portable Document Format', suffixes: 'pdf' }
+            ];
+            mimeTypes.length = 2;
+            mimeTypes.item = (i) => mimeTypes[i];
+            mimeTypes.namedItem = (type) => mimeTypes.find(m => m.type === type);
+            return mimeTypes;
           },
           configurable: true
         });
@@ -295,10 +471,39 @@ function processHtml(html: string, baseUrl: string, protocol: string, originalUr
           configurable: true
         });
         
+        // Spoof platform
+        Object.defineProperty(navigator, 'platform', {
+          get: () => 'Win32',
+          configurable: true
+        });
+        
+        // Spoof hardware concurrency
+        Object.defineProperty(navigator, 'hardwareConcurrency', {
+          get: () => 8,
+          configurable: true
+        });
+        
+        // Spoof device memory
+        Object.defineProperty(navigator, 'deviceMemory', {
+          get: () => 8,
+          configurable: true
+        });
+        
         // Hide automation indicators
         delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
         delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
         delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
+        delete window.__webdriver_evaluate;
+        delete window.__selenium_evaluate;
+        delete window.__webdriver_script_function;
+        delete window.__webdriver_script_func;
+        delete window.__webdriver_script_fn;
+        delete window.__fxdriver_evaluate;
+        delete window.__driver_unwrapped;
+        delete window.__webdriver_unwrapped;
+        delete window.__driver_evaluate;
+        delete window.__selenium_unwrapped;
+        delete window.__fxdriver_unwrapped;
         
         // ============================================
         // PHASE 2: Location & Document Spoofing
@@ -336,7 +541,7 @@ function processHtml(html: string, baseUrl: string, protocol: string, originalUr
           toString: function() { return ORIGINAL_URL; }
         };
         
-        // Try to spoof document.location (may not work in all contexts)
+        // Try to spoof document.location
         try {
           Object.defineProperty(document, 'location', {
             get: () => fakeLocation,
@@ -414,7 +619,6 @@ function processHtml(html: string, baseUrl: string, protocol: string, originalUr
           });
         } catch(e) {}
         
-        // Override window.frames
         try {
           Object.defineProperty(window, 'frames', {
             get: () => window,
@@ -426,7 +630,6 @@ function processHtml(html: string, baseUrl: string, protocol: string, originalUr
         // PHASE 4: Service Worker Blocking
         // ============================================
         
-        // Block service worker registration to prevent bypass
         if ('serviceWorker' in navigator) {
           const originalRegister = navigator.serviceWorker.register;
           navigator.serviceWorker.register = function() {
@@ -441,7 +644,7 @@ function processHtml(html: string, baseUrl: string, protocol: string, originalUr
         
         function resolveUrl(url) {
           if (!url || typeof url !== 'string') return url;
-          if (url.startsWith('data:') || url.startsWith('blob:') || url.startsWith('javascript:') || url.startsWith('#')) {
+          if (url.startsWith('data:') || url.startsWith('blob:') || url.startsWith('javascript:') || url.startsWith('#') || url.startsWith('mailto:') || url.startsWith('tel:')) {
             return url;
           }
           try {
@@ -473,7 +676,23 @@ function processHtml(html: string, baseUrl: string, protocol: string, originalUr
         window.__proxyUrl = proxyUrl;
         
         // ============================================
-        // PHASE 6: Fetch & XHR Interception
+        // PHASE 6: URL Constructor Override
+        // ============================================
+        
+        const OriginalURL = window.URL;
+        window.URL = function(url, base) {
+          // Resolve relative URLs using our base
+          if (base === undefined && !url.startsWith('http') && !url.startsWith('data:') && !url.startsWith('blob:')) {
+            base = ORIGINAL_URL;
+          }
+          return new OriginalURL(url, base);
+        };
+        window.URL.prototype = OriginalURL.prototype;
+        window.URL.createObjectURL = OriginalURL.createObjectURL;
+        window.URL.revokeObjectURL = OriginalURL.revokeObjectURL;
+        
+        // ============================================
+        // PHASE 7: Fetch & XHR Interception
         // ============================================
         
         const originalFetch = window.fetch;
@@ -481,12 +700,17 @@ function processHtml(html: string, baseUrl: string, protocol: string, originalUr
           let url = typeof input === 'string' ? input : (input instanceof Request ? input.url : String(input));
           const resolved = resolveUrl(url);
           
-          // Clone init and modify
           const newInit = init ? { ...init } : {};
           
-          // Fix credentials and mode
           if (!newInit.credentials) newInit.credentials = 'include';
           if (newInit.mode === 'same-origin') newInit.mode = 'cors';
+          
+          // Remove problematic headers
+          if (newInit.headers) {
+            const headers = new Headers(newInit.headers);
+            headers.delete('X-Requested-With');
+            newInit.headers = headers;
+          }
           
           if (typeof input === 'string') {
             return originalFetch.call(this, resolved, newInit);
@@ -510,14 +734,15 @@ function processHtml(html: string, baseUrl: string, protocol: string, originalUr
         // Override XMLHttpRequest
         const originalXHROpen = XMLHttpRequest.prototype.open;
         const originalXHRSend = XMLHttpRequest.prototype.send;
+        const originalXHRSetHeader = XMLHttpRequest.prototype.setRequestHeader;
         
         XMLHttpRequest.prototype.open = function(method, url, async, user, password) {
           this._proxyUrl = resolveUrl(url);
+          this._proxyMethod = method;
           return originalXHROpen.call(this, method, this._proxyUrl, async !== false, user, password);
         };
         
         XMLHttpRequest.prototype.send = function(body) {
-          // Set withCredentials for cross-origin requests
           try {
             this.withCredentials = true;
           } catch(e) {}
@@ -525,7 +750,7 @@ function processHtml(html: string, baseUrl: string, protocol: string, originalUr
         };
         
         // ============================================
-        // PHASE 7: Dynamic Element Creation Interception
+        // PHASE 8: Dynamic Element Creation Interception
         // ============================================
         
         const originalCreateElement = document.createElement.bind(document);
@@ -533,7 +758,7 @@ function processHtml(html: string, baseUrl: string, protocol: string, originalUr
           const element = originalCreateElement(tagName, options);
           const tag = tagName.toLowerCase();
           
-          if (['script', 'img', 'link', 'iframe', 'video', 'audio', 'source', 'embed', 'object'].includes(tag)) {
+          if (['script', 'img', 'link', 'iframe', 'video', 'audio', 'source', 'embed', 'object', 'track'].includes(tag)) {
             const originalSetAttribute = element.setAttribute.bind(element);
             
             element.setAttribute = function(name, value) {
@@ -543,11 +768,7 @@ function processHtml(html: string, baseUrl: string, protocol: string, originalUr
               return originalSetAttribute(name, value);
             };
             
-            // Intercept property setters
-            const srcDescriptor = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'src') ||
-                                  Object.getOwnPropertyDescriptor(element.constructor.prototype, 'src');
-            
-            if (tag === 'script' || tag === 'img' || tag === 'iframe' || tag === 'video' || tag === 'audio' || tag === 'embed' || tag === 'source') {
+            if (['script', 'img', 'iframe', 'video', 'audio', 'embed', 'source', 'track'].includes(tag)) {
               Object.defineProperty(element, 'src', {
                 set: function(value) {
                   const resolved = resolveUrl(value);
@@ -568,6 +789,19 @@ function processHtml(html: string, baseUrl: string, protocol: string, originalUr
                 },
                 get: function() {
                   return element.getAttribute('href');
+                },
+                configurable: true
+              });
+            }
+            
+            if (tag === 'video') {
+              Object.defineProperty(element, 'poster', {
+                set: function(value) {
+                  const resolved = resolveUrl(value);
+                  originalSetAttribute('poster', resolved);
+                },
+                get: function() {
+                  return element.getAttribute('poster');
                 },
                 configurable: true
               });
@@ -615,16 +849,13 @@ function processHtml(html: string, baseUrl: string, protocol: string, originalUr
         }
         
         // ============================================
-        // PHASE 8: WebSocket Wrapper
+        // PHASE 9: WebSocket Wrapper
         // ============================================
         
         const OriginalWebSocket = window.WebSocket;
         window.WebSocket = function(url, protocols) {
-          // Convert ws:// to wss:// if needed and resolve URL
           let wsUrl = url;
           if (url.startsWith('ws://') || url.startsWith('wss://')) {
-            // WebSockets need to go directly to the target for now
-            // Full WebSocket proxying would require a separate WebSocket server
             console.log('[Proxy] WebSocket connection:', url);
           } else if (url.startsWith('//')) {
             wsUrl = 'wss:' + url;
@@ -640,7 +871,7 @@ function processHtml(html: string, baseUrl: string, protocol: string, originalUr
         window.WebSocket.CLOSED = OriginalWebSocket.CLOSED;
         
         // ============================================
-        // PHASE 9: Worker Interception
+        // PHASE 10: Worker Interception
         // ============================================
         
         const OriginalWorker = window.Worker;
@@ -664,10 +895,9 @@ function processHtml(html: string, baseUrl: string, protocol: string, originalUr
         }
         
         // ============================================
-        // PHASE 10: Navigation Interception
+        // PHASE 11: Navigation Interception
         // ============================================
         
-        // Real parent reference for messaging
         const realParent = window.parent;
         
         // Intercept link clicks
@@ -711,7 +941,6 @@ function processHtml(html: string, baseUrl: string, protocol: string, originalUr
                 url: urlWithParams
               }, '*');
             } else {
-              // For POST forms, update action URL
               form.setAttribute('action', resolveUrl(action));
             }
           }
@@ -736,7 +965,6 @@ function processHtml(html: string, baseUrl: string, protocol: string, originalUr
         try {
           const locationDescriptor = Object.getOwnPropertyDescriptor(window, 'location');
           if (locationDescriptor && locationDescriptor.set) {
-            const originalLocationSetter = locationDescriptor.set;
             Object.defineProperty(window, 'location', {
               get: () => fakeLocation,
               set: function(value) {
@@ -749,7 +977,7 @@ function processHtml(html: string, baseUrl: string, protocol: string, originalUr
         } catch(e) {}
         
         // ============================================
-        // PHASE 11: History API Override
+        // PHASE 12: History API Override
         // ============================================
         
         const originalPushState = history.pushState;
@@ -762,7 +990,6 @@ function processHtml(html: string, baseUrl: string, protocol: string, originalUr
               type: 'proxy-url-change',
               url: resolved
             }, '*');
-            // Update our fake location
             try {
               fakeLocation.href = resolved;
               fakeLocation.pathname = new URL(resolved).pathname;
@@ -798,13 +1025,11 @@ function processHtml(html: string, baseUrl: string, protocol: string, originalUr
         });
         
         // ============================================
-        // PHASE 12: PostMessage Interception
+        // PHASE 13: PostMessage Interception
         // ============================================
         
-        // Make postMessage work with our spoofed origin
         const originalPostMessage = window.postMessage;
         window.postMessage = function(message, targetOrigin, transfer) {
-          // Allow all origins since we're proxying
           if (targetOrigin === TARGET_ORIGIN || targetOrigin === '*') {
             return originalPostMessage.call(this, message, '*', transfer);
           }
@@ -812,10 +1037,9 @@ function processHtml(html: string, baseUrl: string, protocol: string, originalUr
         };
         
         // ============================================
-        // PHASE 13: Cookie & Storage Handling
+        // PHASE 14: Cookie & Storage Handling
         // ============================================
         
-        // Override document.cookie to handle cross-origin cookies
         const originalCookieDescriptor = Object.getOwnPropertyDescriptor(Document.prototype, 'cookie');
         if (originalCookieDescriptor) {
           Object.defineProperty(document, 'cookie', {
@@ -823,7 +1047,6 @@ function processHtml(html: string, baseUrl: string, protocol: string, originalUr
               return originalCookieDescriptor.get.call(this);
             },
             set: function(value) {
-              // Remove domain restrictions from cookies
               let modifiedCookie = value.replace(/;\\s*domain=[^;]*/gi, '');
               modifiedCookie = modifiedCookie.replace(/;\\s*secure/gi, '');
               modifiedCookie = modifiedCookie.replace(/;\\s*samesite=[^;]*/gi, '');
@@ -833,19 +1056,57 @@ function processHtml(html: string, baseUrl: string, protocol: string, originalUr
           });
         }
         
-        console.log('[Proxy] Advanced anti-detection loaded for:', TARGET_HOSTNAME);
+        // ============================================
+        // PHASE 15: Canvas Fingerprint Protection
+        // ============================================
+        
+        const originalToDataURL = HTMLCanvasElement.prototype.toDataURL;
+        const originalGetImageData = CanvasRenderingContext2D.prototype.getImageData;
+        
+        HTMLCanvasElement.prototype.toDataURL = function() {
+          // Add slight noise to fingerprinting attempts
+          const ctx = this.getContext('2d');
+          if (ctx) {
+            const imageData = originalGetImageData.call(ctx, 0, 0, this.width, this.height);
+            for (let i = 0; i < imageData.data.length; i += 4) {
+              imageData.data[i] = imageData.data[i] ^ (Math.random() > 0.99 ? 1 : 0);
+            }
+            ctx.putImageData(imageData, 0, 0);
+          }
+          return originalToDataURL.apply(this, arguments);
+        };
+        
+        // ============================================
+        // PHASE 16: Title Update Notification
+        // ============================================
+        
+        const originalTitleDescriptor = Object.getOwnPropertyDescriptor(Document.prototype, 'title');
+        if (originalTitleDescriptor) {
+          Object.defineProperty(document, 'title', {
+            get: function() {
+              return originalTitleDescriptor.get.call(this);
+            },
+            set: function(value) {
+              originalTitleDescriptor.set.call(this, value);
+              realParent.postMessage({
+                type: 'proxy-title-change',
+                title: value
+              }, '*');
+            },
+            configurable: true
+          });
+        }
+        
+        // Send initial title
+        setTimeout(() => {
+          realParent.postMessage({
+            type: 'proxy-title-change',
+            title: document.title
+          }, '*');
+        }, 100);
+        
+        console.log('[Proxy] Advanced anti-detection v2 loaded for:', TARGET_HOSTNAME);
       })();
     </script>
   `;
-  
-  // Inject before </head> or at the start
-  if (processed.match(/<\/head>/i)) {
-    processed = processed.replace(/<\/head>/i, `${injection}</head>`);
-  } else if (processed.match(/<body[^>]*>/i)) {
-    processed = processed.replace(/<body([^>]*)>/i, `${injection}<body$1>`);
-  } else {
-    processed = injection + processed;
-  }
-  
-  return processed;
 }
