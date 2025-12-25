@@ -88,6 +88,11 @@ serve(async (req) => {
         "Accept-Encoding": "identity",
         "Cache-Control": "no-cache",
         "Pragma": "no-cache",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
       },
       redirect: "follow",
     });
@@ -141,6 +146,25 @@ serve(async (req) => {
         `href="${targetUrl.protocol}//`
       );
       
+      // Fix relative URLs that start with /
+      processedContent = processedContent.replace(
+        /src=["']\//g,
+        `src="${baseUrl}/`
+      );
+      processedContent = processedContent.replace(
+        /href=["']\//g,
+        `href="${baseUrl}/`
+      );
+      
+      // Fix srcset attributes
+      processedContent = processedContent.replace(
+        /srcset=["']([^"']+)["']/gi,
+        (match, srcset) => {
+          const fixedSrcset = srcset.replace(/(^|\s)\/(?!\/)/g, `$1${baseUrl}/`);
+          return `srcset="${fixedSrcset}"`;
+        }
+      );
+      
       // Add CSS to handle body/html sizing for proper iframe display
       const styleInjection = `
         <style>
@@ -148,14 +172,42 @@ serve(async (req) => {
             margin: 0 !important; 
             padding: 0 !important;
             min-height: 100vh !important;
+            overflow-x: hidden !important;
           }
         </style>
+      `;
+      
+      // Inject script to handle relative URLs in dynamically loaded content
+      const scriptInjection = `
+        <script>
+          (function() {
+            var baseUrl = "${baseUrl}";
+            
+            // Override fetch to handle relative URLs
+            var originalFetch = window.fetch;
+            window.fetch = function(url, options) {
+              if (typeof url === 'string' && url.startsWith('/') && !url.startsWith('//')) {
+                url = baseUrl + url;
+              }
+              return originalFetch.call(this, url, options);
+            };
+            
+            // Override XMLHttpRequest
+            var originalOpen = XMLHttpRequest.prototype.open;
+            XMLHttpRequest.prototype.open = function(method, url) {
+              if (typeof url === 'string' && url.startsWith('/') && !url.startsWith('//')) {
+                url = baseUrl + url;
+              }
+              return originalOpen.apply(this, [method, url, ...Array.prototype.slice.call(arguments, 2)]);
+            };
+          })();
+        </script>
       `;
       
       if (processedContent.match(/<\/head>/i)) {
         processedContent = processedContent.replace(
           /<\/head>/i,
-          `${styleInjection}</head>`
+          `${styleInjection}${scriptInjection}</head>`
         );
       }
     }
