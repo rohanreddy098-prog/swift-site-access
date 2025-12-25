@@ -4,17 +4,21 @@ import { LoadingBar } from "@/components/proxy/LoadingBar";
 import { BrowserToolbar } from "@/components/proxy/BrowserToolbar";
 import { AlertTriangle, RefreshCw, ExternalLink, ArrowLeft } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { supabase } from "@/integrations/supabase/client";
 import { toast } from "sonner";
+import { registerServiceWorker, encodeProxyUrl } from "@/lib/registerServiceWorker";
+
+// Wisp server URL - will be set from environment or default
+const WISP_SERVER_URL = import.meta.env.VITE_WISP_SERVER_URL || "";
 
 const Browse = () => {
   const { url } = useParams();
   const navigate = useNavigate();
   const [isLoading, setIsLoading] = useState(true);
-  const [content, setContent] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [currentUrl, setCurrentUrl] = useState<string>("");
   const [pageTitle, setPageTitle] = useState<string>("");
+  const [proxyUrl, setProxyUrl] = useState<string | null>(null);
+  const [swReady, setSwReady] = useState(false);
   const iframeRef = useRef<HTMLIFrameElement>(null);
 
   // History tracking
@@ -23,37 +27,53 @@ const Browse = () => {
 
   const decodedUrl = url ? decodeURIComponent(url) : "";
 
-  const fetchContent = useCallback(async (targetUrl: string, addToHistory = true) => {
+  // Initialize Service Worker
+  useEffect(() => {
+    async function initServiceWorker() {
+      if (!WISP_SERVER_URL) {
+        setError("Wisp server URL not configured. Please set VITE_WISP_SERVER_URL environment variable.");
+        setIsLoading(false);
+        return;
+      }
+
+      try {
+        console.log("[Browse] Initializing Ultraviolet Service Worker...");
+        await registerServiceWorker(WISP_SERVER_URL);
+        setSwReady(true);
+        console.log("[Browse] Service Worker ready!");
+      } catch (err) {
+        console.error("[Browse] Service Worker initialization failed:", err);
+        setError(`Failed to initialize proxy: ${err instanceof Error ? err.message : "Unknown error"}`);
+        setIsLoading(false);
+      }
+    }
+
+    initServiceWorker();
+  }, []);
+
+  // Load content when SW is ready and URL changes
+  useEffect(() => {
+    if (!decodedUrl) {
+      navigate("/");
+      return;
+    }
+
+    if (!swReady) return;
+
     setIsLoading(true);
     setError(null);
-    setCurrentUrl(targetUrl);
+    setCurrentUrl(decodedUrl);
     setPageTitle("");
 
     try {
-      const { data, error: fnError } = await supabase.functions.invoke("proxy", {
-        body: { url: targetUrl },
-      });
-
-      if (fnError) {
-        throw new Error(fnError.message);
-      }
-
-      if (data.error) {
-        throw new Error(data.error);
-      }
-
-      setContent(data.content);
-
-      // Extract page title from content
-      const titleMatch = data.content.match(/<title[^>]*>([^<]+)<\/title>/i);
-      if (titleMatch) {
-        setPageTitle(titleMatch[1].trim());
-      }
-
+      // Encode URL for Ultraviolet proxy
+      const encodedUrl = encodeProxyUrl(decodedUrl);
+      setProxyUrl(encodedUrl);
+      
       // Add to history
-      if (addToHistory) {
+      if (history.length === 0 || history[historyIndex] !== decodedUrl) {
         setHistory(prev => {
-          const newHistory = [...prev.slice(0, historyIndex + 1), targetUrl];
+          const newHistory = [...prev.slice(0, historyIndex + 1), decodedUrl];
           return newHistory;
         });
         setHistoryIndex(prev => prev + 1);
@@ -62,48 +82,29 @@ const Browse = () => {
       const message = err instanceof Error ? err.message : "Failed to load website";
       setError(message);
       toast.error(message);
-    } finally {
       setIsLoading(false);
     }
-  }, [historyIndex]);
+  }, [decodedUrl, navigate, swReady]);
 
-  useEffect(() => {
-    if (!decodedUrl) {
-      navigate("/");
-      return;
-    }
-
-    // Initialize history with the first URL
-    if (history.length === 0) {
-      setHistory([decodedUrl]);
-      setHistoryIndex(0);
-    }
-
-    fetchContent(decodedUrl, false);
-  }, [decodedUrl, navigate]);
-
-  // Listen for navigation messages from iframe
-  useEffect(() => {
-    const handleMessage = (event: MessageEvent) => {
-      if (event.data?.type === 'proxy-navigate') {
-        const newUrl = event.data.url;
-        console.log('[Browse] Navigation request:', newUrl);
-        
-        if (event.data.newTab) {
-          window.open(`/browse/${encodeURIComponent(newUrl)}`, '_blank');
-        } else {
-          navigate(`/browse/${encodeURIComponent(newUrl)}`);
-        }
-      } else if (event.data?.type === 'proxy-url-change') {
-        setCurrentUrl(event.data.url);
-      } else if (event.data?.type === 'proxy-title-change') {
-        setPageTitle(event.data.title);
+  // Handle iframe load
+  const handleIframeLoad = useCallback(() => {
+    setIsLoading(false);
+    
+    // Try to get page title from iframe
+    try {
+      const iframe = iframeRef.current;
+      if (iframe?.contentDocument?.title) {
+        setPageTitle(iframe.contentDocument.title);
       }
-    };
+    } catch {
+      // Cross-origin restrictions prevent access
+    }
+  }, []);
 
-    window.addEventListener('message', handleMessage);
-    return () => window.removeEventListener('message', handleMessage);
-  }, [navigate]);
+  const handleIframeError = useCallback(() => {
+    setIsLoading(false);
+    setError("Failed to load the website. The site may be blocking proxy access.");
+  }, []);
 
   const handleBack = () => {
     if (historyIndex > 0) {
@@ -124,10 +125,9 @@ const Browse = () => {
   };
 
   const handleRefresh = () => {
-    if (currentUrl) {
-      fetchContent(currentUrl, false);
-    } else if (decodedUrl) {
-      fetchContent(decodedUrl, false);
+    if (iframeRef.current && proxyUrl) {
+      setIsLoading(true);
+      iframeRef.current.src = proxyUrl;
     }
   };
 
@@ -164,13 +164,17 @@ const Browse = () => {
 
       {/* Content area */}
       <div className="flex-1 overflow-hidden bg-white">
-        {isLoading && (
+        {isLoading && !error && (
           <div className="flex flex-col items-center justify-center h-full gap-4 bg-zinc-950">
             <div className="w-16 h-16 rounded-full bg-zinc-800 flex items-center justify-center">
               <RefreshCw className="w-8 h-8 text-blue-500 animate-spin" />
             </div>
-            <p className="text-zinc-400">Loading website...</p>
-            <p className="text-sm text-zinc-600">Fetching {currentUrl || decodedUrl}</p>
+            <p className="text-zinc-400">
+              {swReady ? "Loading website..." : "Initializing proxy..."}
+            </p>
+            <p className="text-sm text-zinc-600">
+              {swReady ? `Fetching ${currentUrl || decodedUrl}` : "Connecting to Wisp server..."}
+            </p>
           </div>
         )}
 
@@ -182,9 +186,16 @@ const Browse = () => {
             <div className="text-center">
               <h2 className="text-2xl font-bold mb-2 text-zinc-200">Unable to Load Website</h2>
               <p className="text-zinc-400 max-w-md mb-4">{error}</p>
-              <p className="text-sm text-zinc-600">
-                Some websites use advanced security that prevents proxy access.
-              </p>
+              {!WISP_SERVER_URL && (
+                <div className="text-sm text-zinc-600 bg-zinc-900 p-4 rounded-lg max-w-lg mb-4">
+                  <p className="font-semibold mb-2">Setup Required:</p>
+                  <ol className="list-decimal list-inside text-left space-y-1">
+                    <li>Deploy a Wisp server on Railway or VPS</li>
+                    <li>Add VITE_WISP_SERVER_URL secret with the Wisp URL</li>
+                    <li>Refresh this page</li>
+                  </ol>
+                </div>
+              )}
             </div>
             <div className="flex flex-wrap gap-3 justify-center">
               <Button 
@@ -195,13 +206,15 @@ const Browse = () => {
                 <ArrowLeft className="w-4 h-4 mr-2" />
                 Go Back
               </Button>
-              <Button 
-                onClick={handleRefresh}
-                className="bg-blue-600 hover:bg-blue-700"
-              >
-                <RefreshCw className="w-4 h-4 mr-2" />
-                Try Again
-              </Button>
+              {WISP_SERVER_URL && (
+                <Button 
+                  onClick={handleRefresh}
+                  className="bg-blue-600 hover:bg-blue-700"
+                >
+                  <RefreshCw className="w-4 h-4 mr-2" />
+                  Try Again
+                </Button>
+              )}
               <a href={currentUrl || decodedUrl} target="_blank" rel="noopener noreferrer">
                 <Button 
                   variant="secondary"
@@ -215,12 +228,13 @@ const Browse = () => {
           </div>
         )}
 
-        {!isLoading && !error && content && (
+        {!error && proxyUrl && swReady && (
           <iframe
             ref={iframeRef}
-            srcDoc={content}
+            src={proxyUrl}
             className="w-full h-full border-0"
-            sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox allow-presentation allow-modals"
+            onLoad={handleIframeLoad}
+            onError={handleIframeError}
             title="Proxied content"
           />
         )}
