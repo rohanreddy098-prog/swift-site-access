@@ -1,0 +1,15 @@
+{
+  "name": "wisp-server",
+  "version": "1.0.0",
+  "description": "Wisp WebSocket server for Ultraviolet proxy",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "wisp-server-node": "^1.1.4"
+  }
+}
