@@ -77,22 +77,26 @@ serve(async (req) => {
       });
     }
 
-    // Fetch the target URL
+    // Fetch the target URL with better headers
     console.log(`Proxying request to: ${url}`);
     
     const response = await fetch(url, {
       headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "identity",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
       },
+      redirect: "follow",
     });
 
     const contentType = response.headers.get("content-type") || "";
     const content = await response.text();
 
-    // Log request for analytics
-    await supabase.from("proxy_requests").insert({
+    // Log request for analytics (fire and forget)
+    supabase.from("proxy_requests").insert({
       target_url: url,
       status_code: response.status,
       response_size: content.length,
@@ -104,17 +108,56 @@ serve(async (req) => {
     if (contentType.includes("text/html")) {
       const baseUrl = `${targetUrl.protocol}//${targetUrl.host}`;
       
-      // Add base tag for relative URLs
-      processedContent = processedContent.replace(
-        /<head[^>]*>/i,
-        `$&<base href="${baseUrl}/">`
-      );
+      // Inject base tag right after opening head tag
+      if (processedContent.match(/<head[^>]*>/i)) {
+        processedContent = processedContent.replace(
+          /<head([^>]*)>/i,
+          `<head$1><base href="${baseUrl}/" target="_self">`
+        );
+      } else {
+        // If no head tag, add one
+        processedContent = `<head><base href="${baseUrl}/" target="_self"></head>` + processedContent;
+      }
       
-      // Remove CSP headers that might block content
+      // Remove Content-Security-Policy meta tags that might block content
       processedContent = processedContent.replace(
-        /<meta[^>]*content-security-policy[^>]*>/gi,
+        /<meta[^>]*http-equiv=["']?Content-Security-Policy["']?[^>]*>/gi,
         ""
       );
+      
+      // Remove X-Frame-Options meta tags
+      processedContent = processedContent.replace(
+        /<meta[^>]*http-equiv=["']?X-Frame-Options["']?[^>]*>/gi,
+        ""
+      );
+      
+      // Fix protocol-relative URLs
+      processedContent = processedContent.replace(
+        /src=["']\/\//g,
+        `src="${targetUrl.protocol}//`
+      );
+      processedContent = processedContent.replace(
+        /href=["']\/\//g,
+        `href="${targetUrl.protocol}//`
+      );
+      
+      // Add CSS to handle body/html sizing for proper iframe display
+      const styleInjection = `
+        <style>
+          html, body { 
+            margin: 0 !important; 
+            padding: 0 !important;
+            min-height: 100vh !important;
+          }
+        </style>
+      `;
+      
+      if (processedContent.match(/<\/head>/i)) {
+        processedContent = processedContent.replace(
+          /<\/head>/i,
+          `${styleInjection}</head>`
+        );
+      }
     }
 
     return new Response(
