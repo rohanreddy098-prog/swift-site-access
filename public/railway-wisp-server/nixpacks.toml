@@ -1,7 +1,0 @@
-providers = ["node"]
-
-[phases.setup]
-nixPkgs = ["nodejs_20", "npm"]
-
-[phases.install]
-cmds = ["rm -f bun.lockb", "npm install --legacy-peer-deps"]
