@@ -79,28 +79,12 @@ const Browse = () => {
     return () => window.removeEventListener('message', handleMessage);
   }, [navigate]);
 
-  // Adjust iframe height after load
+  // Set iframe to full viewport height - no dynamic adjustment to prevent flickering
   useEffect(() => {
     const iframe = iframeRef.current;
     if (iframe && content) {
-      const handleLoad = () => {
-        try {
-          const doc = iframe.contentDocument;
-          if (doc) {
-            const height = Math.max(
-              doc.body?.scrollHeight || 0,
-              doc.documentElement?.scrollHeight || 0,
-              800
-            );
-            iframe.style.height = `${height}px`;
-          }
-        } catch {
-          // Cross-origin restrictions, use default height
-        }
-      };
-      
-      iframe.addEventListener("load", handleLoad);
-      return () => iframe.removeEventListener("load", handleLoad);
+      // Use viewport height instead of dynamic content height to prevent flickering
+      iframe.style.height = 'calc(100vh - 48px)';
     }
   }, [content]);
 
