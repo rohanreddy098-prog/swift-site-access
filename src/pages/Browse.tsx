@@ -40,11 +40,6 @@ const Browse = () => {
           throw new Error(data.error);
         }
 
-        // Check if the response indicates a blocked site
-        if (data.status === 403 || data.content?.includes("Access denied")) {
-          throw new Error("This website has blocked access from our proxy servers. Try visiting it directly.");
-        }
-
         setContent(data.content);
       } catch (err) {
         const message = err instanceof Error ? err.message : "Failed to load website";
